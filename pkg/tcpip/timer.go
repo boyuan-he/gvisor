@@ -110,6 +110,8 @@ type CancellableTimer struct {
 	fn func()
 }
 
+var _ Timer = (*CancellableTimer)(nil)
+
 // StopLocked prevents the Timer from firing if it has not fired already.
 //
 // If the timer is blocked on obtaining the t.locker lock when StopLocked is
