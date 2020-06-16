@@ -120,6 +120,7 @@ func NewInotifyFD(ctx context.Context, vfsObj *VirtualFilesystem, flags uint32) 
 // watches and frees all resources for an inotify instance.
 func (i *Inotify) Release() {
 	var ds []*Dentry
+
 	// We need to hold i.mu to avoid a race with concurrent calls to
 	// Inotify.handleDeletion from Watches. There's no risk of Watches
 	// accessing this Inotify after the destructor ends, because we remove all
@@ -307,19 +308,6 @@ func (i *Inotify) nextWatchIDLocked() int32 {
 	return i.nextWatchMinusOne
 }
 
-// handleDeletion handles the deletion of the target of watch w. It removes w
-// from i.watches and a watch removal event is generated.
-func (i *Inotify) handleDeletion(w *Watch) {
-	i.mu.Lock()
-	_, found := i.watches[w.wd]
-	delete(i.watches, w.wd)
-	i.mu.Unlock()
-
-	if found {
-		i.queueEvent(newEvent(w.wd, "", linux.IN_IGNORED, 0))
-	}
-}
-
 // AddWatch constructs a new inotify watch and adds it to the target. It
 // returns the watch descriptor returned by inotify_add_watch(2).
 //
@@ -459,40 +447,49 @@ func (w *Watches) Remove(id uint64) {
 		return
 	}
 
-	if _, ok := w.ws[id]; !ok {
-		// While there's technically no problem with silently ignoring a missing
-		// watch, this is almost certainly a bug.
-		panic(fmt.Sprintf("Attempt to remove a watch, but no watch found with provided id %+v.", id))
+	// It is possible for w.Remove() to be called for the same watch multiple
+	// times. See the treatment of one-shot watches in Watches.Notify().
+	if _, ok := w.ws[id]; ok {
+		delete(w.ws, id)
 	}
-	delete(w.ws, id)
 }
 
-// Notify queues a new event with all watches in this set.
-func (w *Watches) Notify(name string, events, cookie uint32, et EventType) {
-	w.NotifyWithExclusions(name, events, cookie, et, false)
-}
+// Notify queues a new event with watches in this set. Watches with
+// IN_EXCL_UNLINK are skipped if the event is coming from a child that has been
+// unlinked.
+func (w *Watches) Notify(name string, events, cookie uint32, et EventType, unlinked bool) {
+	toRemove := make(map[*Watch]struct{})
 
-// NotifyWithExclusions queues a new event with watches in this set. Watches
-// with IN_EXCL_UNLINK are skipped if the event is coming from a child that
-// has been unlinked.
-func (w *Watches) NotifyWithExclusions(name string, events, cookie uint32, et EventType, unlinked bool) {
-	// N.B. We don't defer the unlocks because Notify is in the hot path of
-	// all IO operations, and the defer costs too much for small IO
-	// operations.
-	w.mu.RLock()
+	w.mu.Lock()
 	for _, watch := range w.ws {
-		if unlinked && watch.ExcludeUnlinkedChildren() && et == PathEvent {
+		if unlinked && watch.ExcludeUnlinked() && et == PathEvent {
 			continue
 		}
-		watch.Notify(name, events, cookie)
+		remove := watch.Notify(name, events, cookie)
+		if remove {
+			toRemove[watch] = struct{}{}
+		}
 	}
-	w.mu.RUnlock()
+	for watch := range toRemove {
+		// Remove all one-shot watches on w that delivered an event. Note that this
+		// is an incomplete cleanup--we have to call Inotify.RmWatch, but only
+		// after w.mu is released to avoid deadlocks. This preliminary step needs
+		// to be taken avoid races with other events that may occur between the
+		// original event and the watch removal.
+		delete(w.ws, watch.owner.id)
+	}
+	w.mu.Unlock()
+
+	for watch := range toRemove {
+		watch.owner.RmWatch(watch.wd)
+	}
 }
 
-// HandleDeletion is called when the watch target is destroyed to emit
-// the appropriate events.
+// HandleDeletion is called when the watch target is destroyed. Clear the
+// watch set, detach watches from the inotify instances they belong to, and
+// generate the appropriate events.
 func (w *Watches) HandleDeletion() {
-	w.Notify("", linux.IN_DELETE_SELF, 0, InodeEvent)
+	w.Notify("", linux.IN_DELETE_SELF, 0, InodeEvent, true /* unlinked */)
 
 	// We can't hold w.mu while calling watch.handleDeletion to preserve lock
 	// ordering w.r.t to the owner inotify instances. Instead, atomically move
@@ -510,9 +507,23 @@ func (w *Watches) HandleDeletion() {
 	w.ws = nil
 	w.mu.Unlock()
 
+	// Remove each watch from its owner's watch set, and generate a corresponding
+	// watch removal event.
 	for _, watch := range ws {
-		// TODO(gvisor.dev/issue/1479): consider refactoring this.
-		watch.handleDeletion()
+		i := watch.owner
+		i.mu.Lock()
+		_, found := i.watches[watch.wd]
+		delete(i.watches, watch.wd)
+
+		// Release mutex before notifying waiters because we don't control what
+		// they can do.
+		i.mu.Unlock()
+
+		// If watch was not found, it was removed from the inotify instance before
+		// we could get to it, in which case we should not generate an event.
+		if found {
+			i.queueEvent(newEvent(watch.wd, "", linux.IN_IGNORED, 0))
+		}
 	}
 }
 
@@ -539,23 +550,22 @@ func (w *Watch) OwnerID() uint64 {
 	return w.owner.id
 }
 
-// ExcludeUnlinkedChildren indicates whether the watched object should continue
-// to be notified of events of its children after they have been unlinked, e.g.
-// for an open file descriptor.
+// ExcludeUnlinked indicates whether the watched object should continue to be
+// notified of events originating from a path that has been unlinked.
 //
-// TODO(gvisor.dev/issue/1479): Implement IN_EXCL_UNLINK.
-// We can do this by keeping track of the set of unlinked children in Watches
-// to skip notification.
-func (w *Watch) ExcludeUnlinkedChildren() bool {
+// For example, if "foo/bar" is opened and then unlinked, operations on the
+// open fd may be ignored by watches on "foo" and "foo/bar" with IN_EXCL_UNLINK.
+func (w *Watch) ExcludeUnlinked() bool {
 	return atomic.LoadUint32(&w.mask)&linux.IN_EXCL_UNLINK != 0
 }
 
-// Notify queues a new event on this watch.
-func (w *Watch) Notify(name string, events uint32, cookie uint32) {
+// Notify queues a new event on this watch. Returns true if this is a one-shot
+// watch that should be deleted, after an event was successfully queued.
+func (w *Watch) Notify(name string, events uint32, cookie uint32) bool {
 	mask := atomic.LoadUint32(&w.mask)
 	if mask&events == 0 {
 		// We weren't watching for this event.
-		return
+		return false
 	}
 
 	// Event mask should include bits matched from the watch plus all control
@@ -564,11 +574,7 @@ func (w *Watch) Notify(name string, events uint32, cookie uint32) {
 	effectiveMask := unmaskableBits | mask
 	matchedEvents := effectiveMask & events
 	w.owner.queueEvent(newEvent(w.wd, name, matchedEvents, cookie))
-}
-
-// handleDeletion handles the deletion of w's target.
-func (w *Watch) handleDeletion() {
-	w.owner.handleDeletion(w)
+	return mask&linux.IN_ONESHOT != 0
 }
 
 // Event represents a struct inotify_event from linux.
@@ -710,10 +716,10 @@ func InotifyEventFromStatMask(mask uint32) uint32 {
 // parent/child notifications, the child is notified first in this case.
 func InotifyRemoveChild(self, parent *Watches, name string) {
 	if self != nil {
-		self.Notify("", linux.IN_ATTRIB, 0, InodeEvent)
+		self.Notify("", linux.IN_ATTRIB, 0, InodeEvent, true /* unlinked */)
 	}
 	if parent != nil {
-		parent.Notify(name, linux.IN_DELETE, 0, InodeEvent)
+		parent.Notify(name, linux.IN_DELETE, 0, InodeEvent, true /* unlinked */)
 	}
 }
 
@@ -726,13 +732,13 @@ func InotifyRename(ctx context.Context, renamed, oldParent, newParent *Watches, 
 	}
 	cookie := uniqueid.InotifyCookie(ctx)
 	if oldParent != nil {
-		oldParent.Notify(oldName, dirEv|linux.IN_MOVED_FROM, cookie, InodeEvent)
+		oldParent.Notify(oldName, dirEv|linux.IN_MOVED_FROM, cookie, InodeEvent, false /* unlinked */)
 	}
 	if newParent != nil {
-		newParent.Notify(newName, dirEv|linux.IN_MOVED_TO, cookie, InodeEvent)
+		newParent.Notify(newName, dirEv|linux.IN_MOVED_TO, cookie, InodeEvent, false /* unlinked */)
 	}
 	// Somewhat surprisingly, self move events do not have a cookie.
 	if renamed != nil {
-		renamed.Notify("", linux.IN_MOVE_SELF, 0, InodeEvent)
+		renamed.Notify("", linux.IN_MOVE_SELF, 0, InodeEvent, false /* unlinked */)
 	}
 }
