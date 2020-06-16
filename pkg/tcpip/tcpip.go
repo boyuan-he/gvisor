@@ -192,7 +192,24 @@ func (e ErrSaveRejection) Error() string {
 	return "save rejected due to unsupported networking state: " + e.Err.Error()
 }
 
-// A Clock provides the current time.
+// Timer represents some work that can be scheduled for execution.
+type Timer interface {
+	// StopLocked prevents the Timer from firing if it has not fired already.
+	//
+	// The appropriate locking MUST be in place for the resource managed by the
+	// timer. If the timer is blocked on obtaining the lock when StopLocked is
+	// called, it will early return.
+	StopLocked()
+
+	// Reset changes the timer to expire after duration d.
+	//
+	// Reset should be invoked only on stopped or expired timers. To be safe,
+	// callers should always call StopLocked before calling Reset.
+	Reset(d time.Duration)
+}
+
+// A Clock provides the current time and schedules cancellable tasks for
+// execution.
 //
 // Times returned by a Clock should always be used for application-visible
 // time. Only monotonic times should be used for netstack internal timekeeping.
@@ -203,6 +220,17 @@ type Clock interface {
 
 	// NowMonotonic returns a monotonic time value.
 	NowMonotonic() int64
+
+	// NewTimer creates a new Timer.
+	//
+	// l MUST be locked prior to calling the returned timer's StopLocked().
+	NewTimer(l sync.Locker, f func()) Timer
+
+	// AfterFunc schedules f to run in its own goroutine with l held after d has
+	// elapsed. It returns a timer that can be used to cancel the call.
+	//
+	// l MUST be locked prior to calling the returned timer's StopLocked().
+	AfterFunc(l sync.Locker, d time.Duration, f func()) Timer
 }
 
 // Address is a byte slice cast as a string that represents the address of a

@@ -1465,6 +1465,18 @@ func (k *Kernel) NowMonotonic() int64 {
 	return now
 }
 
+// NewTimer implements tcpip.Clock.NewTimer.
+func (*Kernel) NewTimer(l sync.Locker, f func()) tcpip.Timer {
+	return tcpip.NewCancellableTimer(l, f)
+}
+
+// AfterFunc implements tcpip.Clock.AfterFunc.
+func (k *Kernel) AfterFunc(l sync.Locker, d time.Duration, f func()) tcpip.Timer {
+	timer := k.NewTimer(l, f)
+	timer.Reset(d)
+	return timer
+}
+
 // SetMemoryFile sets Kernel.mf. SetMemoryFile must be called before Init or
 // LoadFrom.
 func (k *Kernel) SetMemoryFile(mf *pgalloc.MemoryFile) {
