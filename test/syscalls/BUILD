@@ -215,6 +215,7 @@ syscall_test(
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:fcntl_test",
+    vfs2 = "True",
 )
 
 syscall_test(
