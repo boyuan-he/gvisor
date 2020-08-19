@@ -24,11 +24,12 @@
 #include <string>
 #include <vector>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "test/util/fuse_util.h"
 #include "test/util/test_util.h"
 
-#include "test/fuse/linux/fuse_base.h"
+#include "fuse_base.h"
 
 namespace gvisor {
 namespace testing {
@@ -36,9 +37,7 @@ namespace testing {
 namespace {
 
 class ReadTest : public FuseTest {
-  // TearDown overrides the parent's function
-  // to skip checking the unconsumed release request at the end.
-  void TearDown() override { UnmountFuse(); }
+  void TearDown() { UnmountFuse(); }
 
  protected:
   const std::string test_file_ = "test_file";
@@ -63,11 +62,19 @@ TEST_F(ReadTest, ReadWhole) {
   FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_path.c_str(), open_flag));
 
-  SkipServerActualRequest();
+  // Can replace with SkipServerActualRequest() after mergerd.
+  struct fuse_in_header in_header_open;
+  struct fuse_open_in in_payload_open;
+  auto iov_in_open = FuseGenerateIovecs(in_header_open, in_payload_open);
+  GetServerActualRequest(iov_in_open);
+
+  EXPECT_EQ(in_header_open.len,
+            sizeof(in_header_open) + sizeof(in_payload_open));
+  EXPECT_EQ(in_header_open.opcode, FUSE_OPEN);
 
   // Prepare for the read.
   const int n_read = 5;
-  std::vector<char> data(n_read, 'a');
+  std::string data = std::string(n_read, 'a');
   struct fuse_out_header read_out_header = {
       .len = static_cast<uint32_t>(sizeof(struct fuse_out_header) +
                                    data.size() + 1),
@@ -76,8 +83,9 @@ TEST_F(ReadTest, ReadWhole) {
   SetServerResponse(FUSE_READ, iov_out_read);
 
   // Read the whole "file".
-  std::vector<char> buf(n_read);
-  EXPECT_THAT(read(fd.get(), buf.data(), n_read), SyscallSucceedsWithValue(n_read));
+  char buf[n_read + 1];
+  EXPECT_THAT(read(fd.get(), buf, n_read), SyscallSucceedsWithValue(n_read));
+  buf[n_read] = '\0';
 
   // Check the read request.
   struct fuse_in_header in_header;
@@ -88,7 +96,7 @@ TEST_F(ReadTest, ReadWhole) {
   EXPECT_EQ(in_header.len, sizeof(in_header) + sizeof(in_payload));
   EXPECT_EQ(in_header.opcode, FUSE_READ);
   EXPECT_EQ(in_payload.offset, 0);
-  EXPECT_EQ(buf, data);
+  EXPECT_STREQ(buf, data.c_str());
 }
 
 TEST_F(ReadTest, ReadPartial) {
@@ -135,11 +143,11 @@ TEST_F(ReadTest, ReadPartial) {
   struct fuse_in_header in_header;
   struct fuse_read_in in_payload;
   auto iov_in = FuseGenerateIovecs(in_header, in_payload);
-  std::vector<char> buf(n_data);
+  char buf[n_data + 1];
 
   // Read 1 bytes.
   SetServerResponse(FUSE_READ, iov_out_read);
-  EXPECT_THAT(read(fd.get(), buf.data(), 1), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(read(fd.get(), buf, 1), SyscallSucceedsWithValue(1));
 
   // Check the 1-byte read request.
   GetServerActualRequest(iov_in);
@@ -149,7 +157,7 @@ TEST_F(ReadTest, ReadPartial) {
 
   // Read 3 bytes.
   SetServerResponse(FUSE_READ, iov_out_read);
-  EXPECT_THAT(read(fd.get(), buf.data(), 3), SyscallSucceedsWithValue(3));
+  EXPECT_THAT(read(fd.get(), buf, 3), SyscallSucceedsWithValue(3));
 
   // Check the 3-byte read request.
   GetServerActualRequest(iov_in);
@@ -157,7 +165,7 @@ TEST_F(ReadTest, ReadPartial) {
 
   // Read 5 bytes.
   SetServerResponse(FUSE_READ, iov_out_read);
-  EXPECT_THAT(read(fd.get(), buf.data(), 5), SyscallSucceedsWithValue(5));
+  EXPECT_THAT(read(fd.get(), buf, 5), SyscallSucceedsWithValue(5));
 
   // Check the 5-byte read request.
   GetServerActualRequest(iov_in);
@@ -195,7 +203,7 @@ TEST_F(ReadTest, PRead) {
 
   // Prepare for the read.
   const int n_read = 5;
-  std::vector<char> data(n_read, 'a');
+  std::string data = std::string(n_read, 'a');
   struct fuse_out_header read_out_header = {
       .len = static_cast<uint32_t>(sizeof(struct fuse_out_header) +
                                    data.size() + 1),
@@ -204,13 +212,11 @@ TEST_F(ReadTest, PRead) {
   SetServerResponse(FUSE_READ, iov_out_read);
 
   // Read some bytes.
-  std::vector<char> buf(n_read);
-  // This 123 works since the hard-coded value for
-  // file size is 512.
-  // Need a way to change that value in the future.
+  char buf[n_read + 1];
   const int offset_read = 123;
-  EXPECT_THAT(pread(fd.get(), buf.data(), n_read, offset_read),
+  EXPECT_THAT(pread(fd.get(), buf, n_read, offset_read),
               SyscallSucceedsWithValue(n_read));
+  buf[n_read] = '\0';
 
   // Check the read request.
   struct fuse_in_header in_header;
@@ -221,7 +227,7 @@ TEST_F(ReadTest, PRead) {
   EXPECT_EQ(in_header.len, sizeof(in_header) + sizeof(in_payload));
   EXPECT_EQ(in_header.opcode, FUSE_READ);
   EXPECT_EQ(in_payload.offset, offset_read);
-  EXPECT_EQ(buf, data);
+  EXPECT_STREQ(buf, data.c_str());
 }
 
 }  // namespace

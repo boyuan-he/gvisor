@@ -15,7 +15,6 @@
 package fuse
 
 import (
-	"fmt"
 	"math"
 	"sync/atomic"
 
@@ -28,17 +27,16 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-// ReadInPages sends FUSE_READ requests for the size after round it up to a multiple of page size,
-// blocks on it for reply, processes the reply and returns the payload (or joined payloads) as a byte slice.
-// This is used for the general purpose reading. We do not support direct IO (which read the exact number of bytes) at this moment.
-func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([]byte, uint32, error) {
+// Read sends a FUSE_READ request, block on it for reply, process the reply and return the payload as a byte slice.
+func (fs *filesystem) Read(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([]byte, uint32, error) {
 	attributeVersion := atomic.LoadUint64(&fs.conn.attributeVersion)
 
-	// Round up to a multiple of page size.
+	// Round up to a multiple of pages size.
+	// size will not be zero, as checked in regularFdReadWriter.ReadToBlocks().
 	readSize, _ := usermem.PageRoundUp(uint64(size))
 
 	// One request cannnot exceed either maxRead or maxPages.
-	maxPages := uint32(math.Floor(float64(fs.conn.maxRead) / usermem.PageSize))
+	maxPages := uint32(math.Ceil(float64(fs.conn.maxRead) / usermem.PageSize))
 	if maxPages > uint32(fs.conn.maxPages) {
 		maxPages = uint32(fs.conn.maxPages)
 	}
@@ -80,7 +78,7 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 			return nil, 0, err
 		}
 
-		// TODO(gvisor.dev/issue/3247): support async read.
+		// TODO(gvisor/dev/issue/3247): support async read.
 
 		res, err := fs.conn.Call(t, req)
 		if err != nil {
@@ -90,14 +88,8 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 			return nil, 0, err
 		}
 
-		// Not enough bytes in response,
-		// either we reached EOF,
-		// or the FUSE server sends back a response
-		// that cannot even fit the hdr.
+		// No bytes in response, e.g. reached EOF.
 		if len(res.data) <= res.hdr.SizeBytes() {
-			if len(res.data) < res.hdr.SizeBytes() {
-				return nil, 0, fmt.Errorf("FUSE_READ response too small. Minimum length required: %d,  but got length %d", res.hdr.SizeBytes(), len(res.data))
-			}
 			break
 		}
 
@@ -109,8 +101,6 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		pagesRead += pagesCanRead
 	}
 
-	defer fs.ReadCallback(ctx, fd, off, size, sizeRead, attributeVersion)
-
 	// No bytes returned; perhaps user tries to read beyond EOF.
 	if len(outs) == 0 {
 		return []byte{}, 0, nil
@@ -119,11 +109,12 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 	// Finished with one reply.
 	// Return the slice directly from the buffer in response.
 	if len(outs) == 1 {
+		fs.ReadCallback(ctx, fd, off, size, sizeRead, attributeVersion)
 		return outs[0], sizeRead, nil
 	}
 
 	// Join data from multiple fragmented replies.
-	// TODO(gvisor.dev/issue/3628): avoid this extra copy,
+	// TODO(gvisor/dev/issue/3628): avoid this extra copy,
 	// perhaps we can use iovec, which requires upperstream support.
 	buf := make([]byte, sizeRead)
 	bufPos := 0
@@ -131,29 +122,30 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		bufPos += copy(buf[bufPos:], v)
 	}
 
+	fs.ReadCallback(ctx, fd, off, size, sizeRead, attributeVersion)
 	return buf, sizeRead, nil
 }
 
 // ReadCallback updates several information after receiving a read response.
 func (fs *filesystem) ReadCallback(ctx context.Context, fd *regularFileFD, off uint64, size uint32, sizeRead uint32, attributeVersion uint64) {
-	// TODO(gvisor.dev/issue/3247): support async read. If this is called by an async read, correctly process it.
+	// TODO(gvisor/dev/issue/3247): support async read. If this is called by an async read, correctly process it.
 	// May need to update the signature.
 
 	i := fd.inode()
 	// TODO(gvisor.dev/issue/1193): Invalidate or update atime.
 
 	// Reached EOF.
-	if sizeRead < size {
+	if size < sizeRead {
 		// TODO(gvisor.dev/issue/3630): If we have writeback cache, then we need to fill this hole.
 		// Might need to update the buf to be returned from the Read().
 
 		// Update existing size.
 		newSize := off + uint64(sizeRead)
 		fs.conn.mu.Lock()
-		if attributeVersion == i.attributeVersion && newSize < atomic.LoadUint64(&i.size) {
+		if attributeVersion == i.attributeVersion && newSize < i.size {
 			fs.conn.attributeVersion++
 			i.attributeVersion = i.fs.conn.attributeVersion
-			atomic.StoreUint64(&i.size, newSize)
+			i.size = newSize
 		}
 		fs.conn.mu.Unlock()
 	}
