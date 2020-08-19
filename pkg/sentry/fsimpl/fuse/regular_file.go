@@ -15,7 +15,9 @@
 package fuse
 
 import (
+	"io"
 	"sync"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -47,16 +49,19 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, syserror.EOPNOTSUPP
 	}
 
-	rw := getRegularFdReadWriter(ctx, fd, uint32(dst.NumBytes()), offset)
-
-	if fd.vfsfd.StatusFlags()&linux.O_DIRECT != 0 {
-		// Require the read to go to the remote file.
-		rw.direct = true
+	size := uint32(dst.NumBytes())
+	if size == 0 {
+		return 0, nil
 	}
+
+	rw := getRegularFDReadWriter(ctx, fd, size, offset)
+
+	// TODO(gvisor.dev/issue/3678): Add direct IO support.
 
 	rw.read()
 	n, err := dst.CopyOutFrom(ctx, rw)
-	putRegularFdReadWriter(rw)
+
+	putRegularFDReadWriter(rw)
 
 	return n, err
 }
@@ -70,63 +75,101 @@ func (fd *regularFileFD) Read(ctx context.Context, dst usermem.IOSequence, opts 
 	return n, err
 }
 
-type regularFdReadWriter struct {
-	ctx    context.Context
-	fd     *regularFileFD
-	off    uint64
-	direct bool
+type regularFDReadWriter struct {
+	ctx context.Context
+	fd  *regularFileFD
 
-	// buffer for bytes read,
-	// it should share the same array with the slice in FUSE response.
-	buf []byte
-	// actual bytes to read.
+	// TODO(gvisor.dev/issue/3678): Add direct IO support.
+
+	// bytes to read.
 	size uint32
+	// offset of read.
+	off uint64
+
 	// actual bytes read.
 	n uint32
 	// read error.
 	err error
+
+	// buffer for bytes read,
+	// ideally it shares the same array with the slice in FUSE response
+	// for the reads that can fit in one FUSE_READ request.
+	buf []byte
 }
 
-func (rw *regularFdReadWriter) fs() *filesystem {
+func (rw *regularFDReadWriter) fs() *filesystem {
 	return rw.fd.inode().fs
 }
 
 var regularFdReadWriterPool = sync.Pool{
 	New: func() interface{} {
-		return &regularFdReadWriter{}
+		return &regularFDReadWriter{}
 	},
 }
 
-func getRegularFdReadWriter(ctx context.Context, fd *regularFileFD, size uint32, offset int64) *regularFdReadWriter {
-	rw := regularFdReadWriterPool.Get().(*regularFdReadWriter)
+func getRegularFDReadWriter(ctx context.Context, fd *regularFileFD, size uint32, offset int64) *regularFDReadWriter {
+	rw := regularFdReadWriterPool.Get().(*regularFDReadWriter)
 	rw.ctx = ctx
 	rw.fd = fd
 	rw.size = size
 	rw.off = uint64(offset)
-	// TODO(gvisor.dev/issue/3237): support indirect IO (e.g. caching)
-	rw.direct = true
 	return rw
 }
 
-func putRegularFdReadWriter(rw *regularFdReadWriter) {
+func putRegularFDReadWriter(rw *regularFDReadWriter) {
 	rw.ctx = nil
 	rw.fd = nil
 	rw.buf = nil
+	rw.n = 0
+	rw.err = nil
 	regularFdReadWriterPool.Put(rw)
 }
 
-// issue the actual FUSE read request.
-// See ReadToBlocks() on its existence.
-func (rw *regularFdReadWriter) read() {
+// read handles and issues the actual FUSE read request.
+// See ReadToBlocks() regarding its purpose.
+func (rw *regularFDReadWriter) read() {
+	// TODO(gvisor.dev/issue/3237): support indirect IO (e.g. caching):
+	// use caching when possible.
+
+	inode := rw.fd.inode()
+
+	// Reading beyond EOF, update file size if outdated.
+	if rw.off+uint64(rw.size) >= atomic.LoadUint64(&inode.size) {
+		if err := inode.reviseAttr(rw.ctx); err != nil {
+			rw.err = err
+			return
+		}
+		// If the offset after update is still too large, return error.
+		if rw.off >= atomic.LoadUint64(&inode.size) {
+			rw.err = io.EOF
+			return
+		}
+	}
+
+	// Truncate the read with updated file size.
+	fileSize := atomic.LoadUint64(&inode.size)
+	if rw.off+uint64(rw.size) > fileSize {
+		// This uint32 conversion will not overflow.
+		// Since rw.off < fileSize and the difference
+		// between must be less than rw.size to make
+		// the if condition true.
+		rw.size = uint32(fileSize - rw.off)
+	}
+
 	// Send the FUSE_READ request and store the data in rw.
-	rw.buf, rw.n, rw.err = rw.fs().Read(rw.ctx, rw.fd, rw.off, rw.size)
+	rw.buf, rw.n, rw.err = rw.fs().ReadInPages(rw.ctx, rw.fd, rw.off, rw.size)
 }
 
 // ReadToBlocks implements safemem.Reader.ReadToBlocks.
 // Due to a deadlock (both the caller of ReadToBlocks and the kernelTask.Block()
 // will try to acquire the same lock), have to separate the rw.read() from the
-// ReadToBlocks() function.
-func (rw *regularFdReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+// ReadToBlocks() function. Therefore, ReadToBlocks() only handles copying
+// the result into user memory while read() handles the actual reading.
+func (rw *regularFDReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+	if rw.err != nil {
+		return 0, rw.err
+	}
+
 	if dsts.IsEmpty() {
 		return 0, nil
 	}
@@ -145,9 +188,10 @@ func (rw *regularFdReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, erro
 		size = rw.n
 	}
 
+	// Assume rw.size is less or equal to dsts.NumBytes().
 	if cp, cperr := safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(rw.buf[:size]))); cperr != nil {
 		return cp, cperr
 	}
 
-	return uint64(size), rw.err
+	return uint64(size), nil
 }
