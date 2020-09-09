@@ -607,6 +607,39 @@ func (r *FUSESymLinkIn) SizeBytes() int {
 	return len(r.Name) + len(r.Target) + 2
 }
 
+// FUSELinkMeta contains static field of FUSELinkIn request.
+//
+// +marshal
+type FUSELinkMeta struct {
+	// OldNodeID is the id of node the link points to.
+	OldNodeID uint64
+}
+
+// FUSELinkIn contains all the arguments sent by the kernel
+// to the daemon to create a link.
+//
+// Dynamically-sized objects cannot be marshalled.
+type FUSELinkIn struct {
+	marshal.StubMarshallable
+
+	// LinkMeta contains old node id of the link.
+	LinkMeta FUSELinkMeta
+
+	// Name of the link to create.
+	Name string
+}
+
+// MarshalBytes serializes r.LinkMeta and r.Name to the dst buffer.
+func (r *FUSELinkIn) MarshalBytes(buf []byte) {
+	r.LinkMeta.MarshalBytes(buf[:r.LinkMeta.SizeBytes()])
+	copy(buf[r.LinkMeta.SizeBytes():], r.Name)
+}
+
+// SizeBytes is the size of the memory representation of FUSELinkIn.
+func (r *FUSELinkIn) SizeBytes() int {
+	return r.LinkMeta.SizeBytes() + len(r.Name) + 1
+}
+
 // FUSEEmptyIn is used by operations without request body.
 type FUSEEmptyIn struct{ marshal.StubMarshallable }
 
