@@ -14,23 +14,21 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fuse.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
-
-#include <linux/fuse.h>
 
 #include <string>
 #include <vector>
 
-#include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "test/fuse/linux/fuse_base.h"
 #include "test/util/fs_util.h"
 #include "test/util/fuse_util.h"
 #include "test/util/test_util.h"
-
-#include "fuse_base.h"
 
 namespace gvisor {
 namespace testing {
@@ -40,30 +38,21 @@ namespace {
 class RmDirTest : public FuseTest {
  protected:
   const std::string test_dir_name_ = "test_dir";
+  const mode_t test_dir_mode_ = S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO;
 };
 
 TEST_F(RmDirTest, NormalRmDir) {
   const std::string test_dir_path_ =
       JoinPath(mount_point_.path().c_str(), test_dir_name_);
 
-  struct fuse_out_header mkdir_header = {
-      .len = sizeof(struct fuse_out_header) + sizeof(struct fuse_entry_out),
-  };
-  mode_t perms = S_IRWXU | S_IRWXG | S_IRWXO;
-  struct fuse_entry_out mkdir_payload = DefaultEntryOut(S_IFDIR | perms, 5);
-
-  auto iov_out = FuseGenerateIovecs(mkdir_header, mkdir_payload);
-  SetServerResponse(FUSE_MKDIR, iov_out);
-
-  ASSERT_THAT(mkdir(test_dir_path_.c_str(), 0777), SyscallSucceeds());
-  SkipServerActualRequest();
+  SetServerInodeLookup(test_dir_name_, test_dir_mode_);
 
   // RmDir code.
   struct fuse_out_header rmdir_header = {
       .len = sizeof(struct fuse_out_header),
   };
 
-  iov_out = FuseGenerateIovecs(rmdir_header);
+  auto iov_out = FuseGenerateIovecs(rmdir_header);
   SetServerResponse(FUSE_RMDIR, iov_out);
 
   ASSERT_THAT(rmdir(test_dir_path_.c_str()), SyscallSucceeds());
@@ -75,7 +64,7 @@ TEST_F(RmDirTest, NormalRmDir) {
 
   EXPECT_EQ(in_header.len, sizeof(in_header) + test_dir_name_.length() + 1);
   EXPECT_EQ(in_header.opcode, FUSE_RMDIR);
-  EXPECT_EQ(0, memcmp(actual_dirname.data(), test_dir_name_.c_str(), test_dir_name_.length() + 1));
+  EXPECT_EQ(std::string(actual_dirname.data()), test_dir_name_);
 }
 
 }  // namespace
